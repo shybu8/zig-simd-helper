@@ -3,22 +3,16 @@ const my_simd = @import("simd");
 const simd = std.simd;
 
 const dprint = std.debug.print;
+const assert = std.debug.assert;
 
 const builtin = @import("builtin");
 const dbg = builtin.mode == .Debug;
-
-pub fn GetVec2(T: type) type {
-    return extern struct {
-        x: T,
-        y: T,
-    };
-}
 
 const page_alloc = std.heap.page_allocator;
 
 pub fn main() !void {
     var prng = std.Random.DefaultPrng.init(blk: {
-        var seed: u64 = undefined;
+        var seed: usize = undefined;
         try std.posix.getrandom(std.mem.asBytes(&seed));
         break :blk seed;
     });
@@ -26,26 +20,27 @@ pub fn main() !void {
 
     var timer = std.time.Timer.start() catch unreachable;
 
-    const T = f64;
+    const T = f32;
+    const scl_len = 3;
     const List = std.ArrayListAligned(T, std.mem.Alignment.@"64");
     const lengths = [_]usize {
-        256,
-        128 * 300,
-        128 * 1024 * 2,
-        128 * 1024 * 7,
-        128 * 1024 * 128,
+        scl_len * 1024,
+        // scl_len * 64 * 300,
+        // scl_len * 64 * 1024 * 2,
+        // scl_len * 64 * 1024 * 10,
+        // scl_len * 64 * 1024 * 25,
     };
-    const scl_len = 2;
-    const pass_amount = 100;
-    dprint("\tPerformance test of\n\t\tb[] = a[] + [(A, B), (A, B), ...]\n\twith {} as individual element\n\t(simd_heler vs llvm vectoried loop)\n\n", .{T});
+    const pass_amount = 50;
+    // const pass_amount = 1;
+    dprint("\tPerformance test\n\tAdding {}-dimensional vector to array of vectors\n\twith {} as individual element\n\t(simd_heler vs llvm vectoried loop)\n\n", .{scl_len, T});
 
     dprint("Pass amount: {}\n\n", .{pass_amount});
 
     for (lengths) |arr_len| {
         const mib_size = @as(f64, @floatFromInt(@bitSizeOf(T) / 8 * arr_len)) / 1024 / 1024;
         dprint("Array length: {}\tMiB size: {d:.3}\n", .{arr_len, mib_size});
-        var llvm_avg: usize = 0;
-        var my_avg: usize = 0;
+        var llvm_avg: u64 = 0;
+        var my_avg: u64 = 0;
         var correctness: bool = true;
 
         var a = List.init(page_alloc);
@@ -60,30 +55,44 @@ pub fn main() !void {
         }
         var r_val: T = 0;
 
+        const zero = switch (@typeInfo(T)) {
+            .float => 0.0,
+            .int => 0,
+            else => @compileError("Unsupported type"),
+        };
+
         for (0..arr_len) |_| {
-            r_val = rand.float(T);
+            r_val = switch(@typeInfo(T)) {
+                .float => rand.float(T),
+                .int => rand.int(T),
+                else => @compileError("Unsupported type"),
+            };
             a.append(r_val) catch unreachable;
-            b1.append(@floatFromInt(0)) catch unreachable;
-            b2.append(@floatFromInt(0)) catch unreachable;
+            b1.append(zero) catch unreachable;
+            b2.append(zero) catch unreachable;
         }
         for (0..scl_len) |_| {
-            r_val = rand.float(T);
+            r_val = switch(@typeInfo(T)) {
+                .float => rand.float(T),
+                .int => rand.int(T),
+                else => @compileError("Unsupported type"),
+            };
             s.append(r_val) catch unreachable;
         }
 
         for (0..pass_amount) |_| {
             if (rand.boolean()) {
                 timer.reset();
-                my_simd.arrayMultielemScalarOp(
+                my_simd.arrayWideScalarOp(
                     scl_len, T,
                     a.items, .add, s.items[0..scl_len].*,
-                    b2.items, .non_temporal,
+                    b2.items, .usual_store,
                 );
                 my_avg += timer.read();
 
                 timer.reset();
                 var i: usize = 0;
-                while (i + scl_len <= a.items.len) : (i += scl_len) {
+                while (i < a.items.len) : (i += scl_len) {
                     inline for (0..scl_len) |j| {
                         b1.items[i + j] = a.items[i + j] + s.items[j];
                     }
@@ -92,7 +101,7 @@ pub fn main() !void {
             } else {
                 timer.reset();
                 var i: usize = 0;
-                while (i + scl_len <= a.items.len) : (i += scl_len) {
+                while (i < a.items.len) : (i += scl_len) {
                     inline for (0..scl_len) |j| {
                         b1.items[i + j] = a.items[i + j] + s.items[j];
                     }
@@ -100,23 +109,35 @@ pub fn main() !void {
                 llvm_avg += timer.read();
 
                 timer.reset();
-                my_simd.arrayMultielemScalarOp(
+                my_simd.arrayWideScalarOp(
                     scl_len, T,
                     a.items, .add, s.items[0..scl_len].*,
-                    b2.items, .non_temporal
+                    b2.items, .usual_store
                 );
                 my_avg += timer.read();
             }
 
             correctness = correctness and std.mem.eql(T, b1.items, b2.items);
+            // printArrOTO(T, b1.items, b2.items);
         }
 
         llvm_avg /= pass_amount;
         my_avg /= pass_amount;
         const speedup = 1 / (@as(f64, @floatFromInt(my_avg)) / @as(f64, @floatFromInt(llvm_avg)));
+        const gflops = @as(f64, @floatFromInt(arr_len)) * (1_000_000_000 / @as(f64, @floatFromInt(my_avg))) / 1_000_000_000;
 
-        dprint("llvm_avg: {} ns\nhlpr_avg: {} ns\ncorrectness: {}\nspeedup: {d}\n\n",
-            .{llvm_avg, my_avg, correctness, speedup});
+        dprint("llvm_avg: {} ns\nhlpr_avg: {} ns\ncorrectness: {}\nspeedup: {d}\tTotal GFLOPS: {d:.3}\n\n",
+            .{llvm_avg, my_avg, correctness, speedup, gflops});
     }
 }
 
+fn printArrOTO(
+    comptime T: type,
+    a: []T,
+    b: []T,
+) void {
+    assert(a.len == b.len);
+    for (0..a.len) |i| {
+        dprint("{}:\t{}\t{}\n", .{i, a[i], b[i]});
+    }
+}
