@@ -10,6 +10,13 @@ const dbg = builtin.mode == .Debug;
 
 const page_alloc = std.heap.page_allocator;
 
+fn invalidate_cache() void {
+    const L3 = 8 * 1024 * 1024;
+    const data = page_alloc.alloc(u8, L3) catch unreachable;
+    @memset(data, 0);
+    page_alloc.free(data);
+}
+
 pub fn main() !void {
     var prng = std.Random.DefaultPrng.init(blk: {
         var seed: usize = undefined;
@@ -20,15 +27,16 @@ pub fn main() !void {
 
     var timer = std.time.Timer.start() catch unreachable;
 
-    const T = f32;
+    const T = f64;
     const scl_len = 3;
+    const nts = my_simd.NonTemporalStoreOption.nt_store;
     const List = std.ArrayListAligned(T, std.mem.Alignment.@"64");
     const lengths = [_]usize {
         scl_len * 1024,
-        // scl_len * 64 * 300,
-        // scl_len * 64 * 1024 * 2,
-        // scl_len * 64 * 1024 * 10,
-        // scl_len * 64 * 1024 * 25,
+        scl_len * 64 * 300,
+        scl_len * 64 * 1024 * 2,
+        scl_len * 64 * 1024 * 10,
+        scl_len * 64 * 1024 * 25,
     };
     const pass_amount = 50;
     // const pass_amount = 1;
@@ -38,7 +46,7 @@ pub fn main() !void {
 
     for (lengths) |arr_len| {
         const mib_size = @as(f64, @floatFromInt(@bitSizeOf(T) / 8 * arr_len)) / 1024 / 1024;
-        dprint("Array length: {}\tMiB size: {d:.3}\n", .{arr_len, mib_size});
+        dprint("Array length: {}\t({} {}-dimensional {} vecs, {d:.3} MIB)\n", .{arr_len, arr_len / scl_len, scl_len, T, mib_size});
         var llvm_avg: u64 = 0;
         var my_avg: u64 = 0;
         var correctness: bool = true;
@@ -80,15 +88,18 @@ pub fn main() !void {
             s.append(r_val) catch unreachable;
         }
 
+        invalidate_cache();
         for (0..pass_amount) |_| {
             if (rand.boolean()) {
                 timer.reset();
                 my_simd.arrayWideScalarOp(
                     scl_len, T,
                     a.items, .add, s.items[0..scl_len].*,
-                    b2.items, .usual_store,
+                    b2.items, nts,
                 );
                 my_avg += timer.read();
+
+                invalidate_cache();
 
                 timer.reset();
                 var i: usize = 0;
@@ -101,6 +112,7 @@ pub fn main() !void {
             } else {
                 timer.reset();
                 var i: usize = 0;
+                
                 while (i < a.items.len) : (i += scl_len) {
                     inline for (0..scl_len) |j| {
                         b1.items[i + j] = a.items[i + j] + s.items[j];
@@ -108,16 +120,19 @@ pub fn main() !void {
                 }
                 llvm_avg += timer.read();
 
+                invalidate_cache();
+
                 timer.reset();
                 my_simd.arrayWideScalarOp(
                     scl_len, T,
                     a.items, .add, s.items[0..scl_len].*,
-                    b2.items, .usual_store
+                    b2.items, nts
                 );
                 my_avg += timer.read();
             }
 
             correctness = correctness and std.mem.eql(T, b1.items, b2.items);
+            invalidate_cache();
             // printArrOTO(T, b1.items, b2.items);
         }
 
