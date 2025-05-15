@@ -31,9 +31,13 @@ pub const NonTemporalStoreOption = enum {
     nt_store,
 };
 
-inline fn nt_flush() void {
-    if (builtin.cpu.arch == .x86_64)
-        asm volatile ("sfence" ::: "memory");
+fn is_capable_to_nts(comptime T: type) bool {
+    return simd.suggestVectorLength(T) != null and
+        builtin.cpu.arch == .x86_64;
+}
+
+inline fn nts_flush() void {
+    asm volatile ("sfence" ::: "memory");
 }
 
 inline fn lcm(a: usize, b: usize) usize {
@@ -51,9 +55,17 @@ pub fn arrayWideScalarOp(
     comptime op: Operation,
     scalar: [scalar_len]T,
     dst: []T,
-    comptime nt: NonTemporalStoreOption,
+    comptime nts: NonTemporalStoreOption,
 ) void {
+    // Prelude
     const simd_len = simd.suggestVectorLength(T) orelse 1;
+    const do_nts = nts == .nt_store and comptime is_capable_to_nts(T);
+    if (do_nts) {
+        const bytes = simd_len * @sizeOf(T) - 1;
+        assert(@intFromPtr(dst.ptr) & bytes == 0);
+    }
+
+    // Window setup
     const scl_window_len = comptime lcm(simd_len, scalar_len);
     const scl_window = @as(
         [scl_window_len]T,
@@ -62,6 +74,8 @@ pub fn arrayWideScalarOp(
             scalar
         ))
     );
+
+    // Body processing
     var i: usize = 0;
     while (i + scl_window_len <= arr.len) : (i += scl_window_len) {
         const arr_window = @as(
@@ -75,9 +89,11 @@ pub fn arrayWideScalarOp(
         wideWindowsOp(
             scl_window_len, T,
             arr_window, op, &scl_window,
-            dst_window, nt
+            dst_window, do_nts
         );
     }
+
+    // Tail processing
     while (i < arr.len) : (i += simd_len) {
         const arr_tail = @as(
             *align(1) const @Vector(simd_len, T),
@@ -96,19 +112,16 @@ pub fn arrayWideScalarOp(
             simd_len, T,
             arr_tail, op, scl_tail
         );
-        if (nt == .usual_store or
-            builtin.cpu.arch != .x86_64 or
-            simd.suggestVectorLength(T) == null)
-        {
-            dst_tail.* = res;
-        } else 
-            desired_asm_nt(
+        if (do_nts) {
+            desired_asm_nts(
                 simd_len, T,
                 res, dst_tail
-            );
+            );           
+        } else
+            dst_tail.* = res;
     }
-    if (nt == .nt_store)
-        nt_flush();
+    if (do_nts)
+        nts_flush();
 }
 
 inline fn makeVecPtrTable(
@@ -117,7 +130,7 @@ inline fn makeVecPtrTable(
     comptime T : type,
     base : *const [N]T,
 ) [N / M]*align(1) @Vector(M,T) {
-    assert(N % M == 0);
+    comptime assert(N % M == 0);
     const scalars = @as(*[N]T, @constCast(base));
 
     var table : [N / M]*align(1) @Vector(M,T) = undefined;
@@ -137,7 +150,7 @@ inline fn wideWindowsOp(
     comptime op: Operation,
     rhs: *const [window_len]T,
     dst: *[window_len]T,
-    comptime nt: NonTemporalStoreOption,
+    comptime do_nts: bool,
 ) void {
     // window_len is guaranteed multiple of simd_len
     const simd_len = simd.suggestVectorLength(T) orelse 1;
@@ -162,20 +175,17 @@ inline fn wideWindowsOp(
             op,
             rhs_subs[i],
         );
-        if (nt == .usual_store or
-            builtin.cpu.arch != .x86_64 or
-            simd.suggestVectorLength(T) == null)
-        {
-            dst_p.* = res;
-        } else 
-            desired_asm_nt(
+        if (do_nts) {
+            desired_asm_nts(
                 simd_len, T,
                 res, dst_p
             );
+        } else 
+            dst_p.* = res;
     }
 }
 
-inline fn desired_asm_nt(
+inline fn desired_asm_nts(
     comptime len: usize,
     comptime T: type,
     vec: @Vector(len, T),
